@@ -42,6 +42,38 @@ def unet(config, train_mode):
     return output
 
 
+def unet_tta(config, train_mode):
+    if train_mode:
+        save_output = False
+        load_saved_output = False
+        preprocessing = preprocessing_train(config, model_name='unet')
+    else:
+        save_output = False
+        load_saved_output = False
+        preprocessing = preprocessing_inference(config)
+
+    unet = Step(name='unet',
+                transformer=PyTorchUNet(**config.model['unet']),
+                input_data=['callback_input'],
+                input_steps=[preprocessing],
+                is_trainable=True,
+                cache_dirpath=config.env.cache_dirpath,
+                save_output=save_output, load_saved_output=load_saved_output)
+
+    if train_mode:
+        return unet
+
+    mask_postprocessed = mask_postprocessing(unet, config, save_output=save_output)
+
+    output = Step(name='output',
+                  transformer=Dummy(),
+                  input_steps=[mask_postprocessed],
+                  adapter={'y_pred': ([(mask_postprocessed.name, 'nuclei_images')]),
+                           },
+                  cache_dirpath=config.env.cache_dirpath)
+    return output
+
+
 def unet_masks(config):
     save_output = False
     load_saved_output = False
@@ -177,6 +209,46 @@ def preprocessing_train(config, model_name='unet'):
 def preprocessing_inference(config, model_name='unet'):
     if config.execution.loader_mode == 'crop_and_pad':
         Loader = loaders.ImageSegmentationLoaderCropPad
+    elif config.execution.loader_mode == 'resize':
+        Loader = loaders.ImageSegmentationLoaderResize
+    else:
+        raise NotImplementedError
+
+    if config.loader.dataset_params.image_source == 'memory':
+        reader_inference = Step(name='reader_inference',
+                                transformer=ImageReader(**config.reader[model_name]),
+                                input_data=['input', 'specs'],
+                                adapter={'meta': ([('input', 'meta')]),
+                                         'train_mode': ([('specs', 'train_mode')]),
+                                         },
+                                cache_dirpath=config.env.cache_dirpath)
+
+    elif config.loader.dataset_params.image_source == 'disk':
+        reader_inference = Step(name='xy_inference',
+                                transformer=XYSplit(**config.xy_splitter[model_name]),
+                                input_data=['specs'],
+                                adapter={'meta': ([('input', 'meta')]),
+                                         'train_mode': ([('specs', 'train_mode')])
+                                         },
+                                cache_dirpath=config.env.cache_dirpath)
+    else:
+        raise NotImplementedError
+
+    loader = Step(name='loader',
+                  transformer=Loader(**config.loader),
+                  input_data=['specs'],
+                  input_steps=[reader_inference],
+                  adapter={'X': ([(reader_inference.name, 'X')], squeeze_inputs_if_needed),
+                           'y': ([(reader_inference.name, 'y')], squeeze_inputs_if_needed),
+                           'train_mode': ([('specs', 'train_mode')]),
+                           },
+                  cache_dirpath=config.env.cache_dirpath)
+    return loader
+
+
+def preprocessing_inference_tta(config, model_name='unet'):
+    if config.execution.loader_mode == 'crop_and_pad':
+        Loader = loaders.ImageSegmentationLoaderCropPadTTA
     elif config.execution.loader_mode == 'resize':
         Loader = loaders.ImageSegmentationLoaderResize
     else:

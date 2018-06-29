@@ -6,12 +6,18 @@ from attrdict import AttrDict
 from sklearn.externals import joblib
 from torch.utils.data import Dataset, DataLoader
 from imgaug import augmenters as iaa
+from skimage.transform import rotate
+from functools import partial
+from itertools import product
+import multiprocessing as mp
+import pandas as pd
+from scipy.stats import gmean
 
 from .steppy.base import BaseTransformer
 from .steppy.pytorch.utils import ImgAug
 
 from .augmentation import affine_seq, color_seq, crop_seq, pad_to_fit_net
-from .utils import from_pil, to_pil
+from .utils import from_pil, to_pil, reseed
 from .pipeline_config import MEAN, STD
 
 
@@ -85,6 +91,39 @@ class ImageSegmentationDataset(Dataset):
     def load_image(self, img_filepath):
         image = Image.open(img_filepath, 'r')
         return image.convert('RGB')
+
+
+class ImageSegmentationTTADataset(ImageSegmentationDataset):
+    def __init__(self, X, tta_params,
+                 image_transform, image_augment_with_target,
+                 mask_transform, image_augment,
+                 image_source='memory'):
+        super().__init__(X, None,image_transform, image_augment_with_target,
+                         mask_transform, image_augment, image_source)
+        self.tta_params = tta_params
+
+    def __getitem__(self, index):
+        if self.image_source == 'memory':
+            load_func = self.load_from_memory
+        elif self.image_source == 'disk':
+            load_func = self.load_from_disk
+        else:
+            raise NotImplementedError("Possible loading options: 'memory' and 'disk'!")
+
+        Xi = load_func(self.X, index)
+
+        if self.tta_params is not None:
+            tta_transform_specs = self.tta_params[index]
+            Xi = test_time_augmentation_transform(Xi, tta_transform_specs)
+
+        if self.image_augment is not None:
+            Xi = self.image_augment(Xi)
+        Xi = to_pil(Xi)
+
+        if self.image_transform is not None:
+            Xi = self.image_transform(Xi)
+
+        return Xi
 
 
 class ImageSegmentationLoaderBasic(BaseTransformer):
@@ -164,6 +203,26 @@ class ImageSegmentationLoaderCropPad(ImageSegmentationLoaderBasic):
         self.image_augment_inference = ImgAug(pad_to_fit_net(self.dataset_params.divisor, self.dataset_params.pad_method))
         self.image_augment_with_target_inference = ImgAug(pad_to_fit_net(self.dataset_params.divisor, self.dataset_params.pad_method))
 
+        self.dataset = ImageSegmentationDataset
+
+
+class ImageSegmentationLoaderCropPadTTA(ImageSegmentationLoaderBasic):
+    def __init__(self, loader_params, dataset_params):
+        super().__init__(loader_params, dataset_params)
+
+        self.image_transform = transforms.Compose([transforms.ToTensor(),
+                                                   transforms.Normalize(mean=MEAN, std=STD),
+                                                   ])
+        self.mask_transform = transforms.Compose([transforms.Lambda(to_array),
+                                                  transforms.Lambda(to_tensor),
+                                                  ])
+        self.image_augment_train = ImgAug(color_seq)
+        self.image_augment_with_target_train = ImgAug(crop_seq(crop_size=(self.dataset_params.h, self.dataset_params.w)))
+        self.image_augment_inference = ImgAug(pad_to_fit_net(self.dataset_params.divisor, self.dataset_params.pad_method))
+        self.image_augment_with_target_inference = ImgAug(pad_to_fit_net(self.dataset_params.divisor, self.dataset_params.pad_method))
+
+        self.dataset = ImageSegmentationTTADataset
+
 
 class ImageSegmentationLoaderResize(ImageSegmentationLoaderBasic):
     def __init__(self, loader_params, dataset_params):
@@ -182,6 +241,161 @@ class ImageSegmentationLoaderResize(ImageSegmentationLoaderBasic):
         self.image_augment_with_target_train = ImgAug(affine_seq)
 
         self.dataset = ImageSegmentationDataset
+
+
+class MetaTestTimeAugmentationGenerator(BaseTransformer):
+    def __init__(self, **kwargs):
+        self.tta_transformations = AttrDict(kwargs)
+
+    def transform(self, X, **kwargs):
+        X_tta_rows, tta_params, img_ids = [], [], []
+        for i in range(len(X)):
+            rows, params, ids = self._get_tta_data(i, X[i])
+            tta_params.extend(params)
+            img_ids.extend(ids)
+            X_tta_rows.extend(rows)
+        X_tta = pd.DataFrame(X_tta_rows)
+        return {'X_tta': X_tta, 'tta_params': tta_params, 'img_ids': img_ids}
+
+    def _get_tta_data(self, i, row):
+        original_specs = {'ud_flip': False, 'lr_flip': False, 'rotation': 0, 'color_shift': False}
+        tta_specs = [original_specs]
+
+        ud_options = [True, False] if self.tta_transformations.flip_ud else [False]
+        lr_options = [True, False] if self.tta_transformations.flip_lr else [False]
+        rot_options = [0, 90, 180, 270] if self.tta_transformations.rotation else [0]
+        if self.tta_transformations.color_shift_runs:
+            color_shift_options = list(range(1, self.tta_transformations.color_shift_runs + 1, 1))
+        else:
+            color_shift_options = [False]
+
+        for ud, lr, rot, color in product(ud_options, lr_options, rot_options, color_shift_options):
+            if ud is False and lr is False and rot == 0 and color is False:
+                continue
+            else:
+                tta_specs.append({'ud_flip': ud, 'lr_flip': lr, 'rotation': rot, 'color_shift': color})
+
+        img_ids = [i] * len(tta_specs)
+        X_rows = [row] * len(tta_specs)
+        return X_rows, tta_specs, img_ids
+
+
+class TestTimeAugmentationGenerator(BaseTransformer):
+    def __init__(self, **kwargs):
+        self.tta_transformations = AttrDict(kwargs)
+
+    def transform(self, X, **kwargs):
+        X_tta, tta_params, img_ids = [], [], []
+        for i in range(len(X[0][0])):
+            images, params, ids = self._get_tta_data(i, X[i])
+            tta_params.extend(params)
+            img_ids.extend(ids)
+            X_tta.extend(images)
+        return {'X_tta': [[X_tta]], 'tta_params': tta_params, 'img_ids': img_ids}
+
+    def _get_tta_data(self, i, row):
+        original_specs = {'ud_flip': False, 'lr_flip': False, 'rotation': 0, 'color_shift': False}
+        tta_specs = [original_specs]
+
+        ud_options = [True, False] if self.tta_transformations.flip_ud else [False]
+        lr_options = [True, False] if self.tta_transformations.flip_lr else [False]
+        rot_options = [0, 90, 180, 270] if self.tta_transformations.rotation else [0]
+        if self.tta_transformations.color_shift_runs:
+            color_shift_options = list(range(1, self.tta_transformations.color_shift_runs + 1, 1))
+        else:
+            color_shift_options = [False]
+
+        for ud, lr, rot, color in product(ud_options, lr_options, rot_options, color_shift_options):
+            if ud is False and lr is False and rot == 0 and color is False:
+                continue
+            else:
+                tta_specs.append({'ud_flip': ud, 'lr_flip': lr, 'rotation': rot, 'color_shift': color})
+
+        img_ids = [i] * len(tta_specs)
+        X_rows = [row] * len(tta_specs)
+        return X_rows, tta_specs, img_ids
+
+
+class TestTimeAugmentationAggregator(BaseTransformer):
+    def __init__(self, method, nthreads):
+        self.method = method
+        self.nthreads = nthreads
+
+    @property
+    def agg_method(self):
+        methods = {'mean': np.mean,
+                   'max': np.max,
+                   'min': np.min,
+                   'gmean': gmean
+                   }
+        return partial(methods[self.method], axis=-1)
+
+    def transform(self, images, tta_params, img_ids, **kwargs):
+        _aggregate_augmentations = partial(aggregate_augmentations,
+                                           images=images,
+                                           tta_params=tta_params,
+                                           img_ids=img_ids,
+                                           agg_method=self.agg_method)
+        unique_img_ids = set(img_ids)
+        threads = min(self.nthreads, len(unique_img_ids))
+        with mp.pool.ThreadPool(threads) as executor:
+            averages_images = executor.map(_aggregate_augmentations, unique_img_ids)
+        return {'aggregated_prediction': averages_images}
+
+
+def aggregate_augmentations(img_id, images, tta_params, img_ids, agg_method):
+    tta_predictions_for_id = []
+    for image, tta_param, ids in zip(images, tta_params, img_ids):
+        if ids == img_id:
+            tta_prediction = test_time_augmentation_inverse_transform(image, tta_param)
+            tta_predictions_for_id.append(tta_prediction)
+        else:
+            continue
+    tta_averaged = agg_method(np.stack(tta_predictions_for_id, axis=-1))
+    return tta_averaged
+
+
+def test_time_augmentation_transform(image, tta_parameters):
+    if tta_parameters['ud_flip']:
+        image = np.flipud(image)
+    elif tta_parameters['lr_flip']:
+        image = np.fliplr(image)
+    elif tta_parameters['color_shift']:
+        random_color_shift = reseed(color_seq, deterministic=False)
+        image = random_color_shift.augment_image(image)
+    image = rotate(image, tta_parameters['rotation'], preserve_range=True)
+    return image
+
+
+def test_time_augmentation_inverse_transform(image, tta_parameters):
+    image = per_channel_rotation(image.copy(), -1 * tta_parameters['rotation'])
+
+    if tta_parameters['ud_flip']:
+        image = per_channel_flipud(image.copy())
+    elif tta_parameters['lr_flip']:
+        image = per_channel_fliplr(image.copy())
+    return image
+
+
+def per_channel_flipud(x):
+    x_ = x.copy()
+    for i, channel in enumerate(x):
+        x_[i, :, :] = np.flipud(channel)
+    return x_
+
+
+def per_channel_fliplr(x):
+    x_ = x.copy()
+    for i, channel in enumerate(x):
+        x_[i, :, :] = np.fliplr(channel)
+    return x_
+
+
+def per_channel_rotation(x, angle):
+    x_ = x.copy()
+    for i, channel in enumerate(x):
+        x_[i, :, :] = rotate(channel, angle, preserve_range=True)
+    return x_
 
 
 def to_array(x):
