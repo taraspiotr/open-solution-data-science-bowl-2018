@@ -225,6 +225,10 @@ def squeeze_inputs_if_needed(inputs):
         return inputs
 
 
+def squeeze_inputs(inputs):
+    return np.squeeze(inputs[0], axis=1)
+
+
 def sigmoid(x):
     return 1. / (1 + np.exp(-x))
 

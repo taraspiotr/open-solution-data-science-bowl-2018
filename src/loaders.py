@@ -6,7 +6,6 @@ from attrdict import AttrDict
 from sklearn.externals import joblib
 from torch.utils.data import Dataset, DataLoader
 from imgaug import augmenters as iaa
-from skimage.transform import rotate
 from functools import partial
 from itertools import product
 import multiprocessing as mp
@@ -93,14 +92,27 @@ class ImageSegmentationDataset(Dataset):
         return image.convert('RGB')
 
 
-class ImageSegmentationTTADataset(ImageSegmentationDataset):
+class ImageSegmentationTTADataset(Dataset):
     def __init__(self, X, tta_params,
                  image_transform, image_augment_with_target,
                  mask_transform, image_augment,
                  image_source='memory'):
-        super().__init__(X, None,image_transform, image_augment_with_target,
-                         mask_transform, image_augment, image_source)
+        super().__init__()
+        self.X = X
+
+        self.image_transform = image_transform
+        self.mask_transform = mask_transform
+        self.image_augment = image_augment if image_augment is not None else ImgAug(iaa.Noop())
+        self.image_augment_with_target = image_augment_with_target if image_augment_with_target is not None else ImgAug(iaa.Noop())
+
+        self.image_source = image_source
         self.tta_params = tta_params
+
+    def __len__(self):
+        if self.image_source == 'memory':
+            return len(self.X[0][0])
+        elif self.image_source == 'disk':
+            return self.X.shape[0]
 
     def __getitem__(self, index):
         if self.image_source == 'memory':
@@ -111,19 +123,31 @@ class ImageSegmentationTTADataset(ImageSegmentationDataset):
             raise NotImplementedError("Possible loading options: 'memory' and 'disk'!")
 
         Xi = load_func(self.X, index)
+        Xi = from_pil(Xi)
+
+        if self.image_augment is not None:
+            Xi = self.image_augment(Xi)
 
         if self.tta_params is not None:
             tta_transform_specs = self.tta_params[index]
             Xi = test_time_augmentation_transform(Xi, tta_transform_specs)
-
-        if self.image_augment is not None:
-            Xi = self.image_augment(Xi)
         Xi = to_pil(Xi)
 
         if self.image_transform is not None:
             Xi = self.image_transform(Xi)
 
         return Xi
+
+    def load_from_memory(self, data_source, index):
+        return data_source[0][0][index]
+
+    def load_from_disk(self, data_source, index):
+        img_filepath = data_source[index]
+        return self.load_image(img_filepath)
+
+    def load_image(self, img_filepath):
+        image = Image.open(img_filepath, 'r')
+        return image.convert('RGB')
 
 
 class ImageSegmentationLoaderBasic(BaseTransformer):
@@ -142,7 +166,7 @@ class ImageSegmentationLoaderBasic(BaseTransformer):
 
         self.dataset = ImageSegmentationDataset
 
-    def transform(self, X, y, X_valid=None, y_valid=None, train_mode=True):
+    def transform(self, X, y=None, X_valid=None, y_valid=None, train_mode=True):
         if train_mode and y is not None:
             flow, steps = self.get_datagen(X, y, True, self.loader_params.training)
         else:
@@ -188,6 +212,50 @@ class ImageSegmentationLoaderBasic(BaseTransformer):
         joblib.dump(params, filepath)
 
 
+class ImageSegmentationLoaderBasicTTA(BaseTransformer):
+    def __init__(self, loader_params, dataset_params):
+        super().__init__()
+        self.loader_params = AttrDict(loader_params)
+        self.dataset_params = AttrDict(dataset_params)
+
+        self.mask_transform = None
+        self.image_transform = None
+
+        self.image_augment = None
+        self.image_augment_with_target = None
+
+        self.dataset = ImageSegmentationTTADataset
+
+    def transform(self, X, tta_params, **kwargs):
+        flow, steps = self.get_datagen(X, tta_params[0], self.loader_params.inference)
+        valid_flow = None
+        valid_steps = None
+        return {'datagen': (flow, steps),
+                'validation_datagen': (valid_flow, valid_steps)}
+
+    def get_datagen(self, X, tta_params, loader_params):
+        dataset = self.dataset(X,
+                               tta_params=tta_params,
+                               image_augment=self.image_augment,
+                               image_augment_with_target=self.image_augment_with_target,
+                               mask_transform=self.mask_transform,
+                               image_transform=self.image_transform,
+                               image_source=self.dataset_params.image_source)
+
+        datagen = DataLoader(dataset, **loader_params)
+        steps = len(datagen)
+        return datagen, steps
+
+    def load(self, filepath):
+        params = joblib.load(filepath)
+        self.loader_params = params['loader_params']
+        return self
+
+    def save(self, filepath):
+        params = {'loader_params': self.loader_params}
+        joblib.dump(params, filepath)
+
+
 class ImageSegmentationLoaderCropPad(ImageSegmentationLoaderBasic):
     def __init__(self, loader_params, dataset_params):
         super().__init__(loader_params, dataset_params)
@@ -206,7 +274,7 @@ class ImageSegmentationLoaderCropPad(ImageSegmentationLoaderBasic):
         self.dataset = ImageSegmentationDataset
 
 
-class ImageSegmentationLoaderCropPadTTA(ImageSegmentationLoaderBasic):
+class ImageSegmentationLoaderCropPadTTA(ImageSegmentationLoaderBasicTTA):
     def __init__(self, loader_params, dataset_params):
         super().__init__(loader_params, dataset_params)
 
@@ -216,10 +284,8 @@ class ImageSegmentationLoaderCropPadTTA(ImageSegmentationLoaderBasic):
         self.mask_transform = transforms.Compose([transforms.Lambda(to_array),
                                                   transforms.Lambda(to_tensor),
                                                   ])
-        self.image_augment_train = ImgAug(color_seq)
-        self.image_augment_with_target_train = ImgAug(crop_seq(crop_size=(self.dataset_params.h, self.dataset_params.w)))
-        self.image_augment_inference = ImgAug(pad_to_fit_net(self.dataset_params.divisor, self.dataset_params.pad_method))
-        self.image_augment_with_target_inference = ImgAug(pad_to_fit_net(self.dataset_params.divisor, self.dataset_params.pad_method))
+        self.image_augment = ImgAug(pad_to_fit_net(self.dataset_params.divisor, self.dataset_params.pad_method))
+        self.image_augment_with_target = ImgAug(pad_to_fit_net(self.dataset_params.divisor, self.dataset_params.pad_method))
 
         self.dataset = ImageSegmentationTTADataset
 
@@ -241,6 +307,23 @@ class ImageSegmentationLoaderResize(ImageSegmentationLoaderBasic):
         self.image_augment_with_target_train = ImgAug(affine_seq)
 
         self.dataset = ImageSegmentationDataset
+
+
+class ImageSegmentationLoaderResizeTTA(ImageSegmentationLoaderBasicTTA):
+    def __init__(self, loader_params, dataset_params):
+        super().__init__(loader_params, dataset_params)
+
+        self.image_transform = transforms.Compose([transforms.Resize((self.dataset_params.h, self.dataset_params.w)),
+                                                   transforms.ToTensor(),
+                                                   transforms.Normalize(mean=MEAN, std=STD),
+                                                   ])
+        self.mask_transform = transforms.Compose([transforms.Resize((self.dataset_params.h, self.dataset_params.w),
+                                                                    interpolation=0),
+                                                  transforms.Lambda(to_array),
+                                                  transforms.Lambda(to_tensor),
+                                                  ])
+
+        self.dataset = ImageSegmentationTTADataset
 
 
 class MetaTestTimeAugmentationGenerator(BaseTransformer):
@@ -286,12 +369,13 @@ class TestTimeAugmentationGenerator(BaseTransformer):
 
     def transform(self, X, **kwargs):
         X_tta, tta_params, img_ids = [], [], []
-        for i in range(len(X[0][0])):
+        X = X[0]
+        for i in range(len(X)):
             images, params, ids = self._get_tta_data(i, X[i])
             tta_params.extend(params)
             img_ids.extend(ids)
             X_tta.extend(images)
-        return {'X_tta': [[X_tta]], 'tta_params': tta_params, 'img_ids': img_ids}
+        return {'X_tta': [X_tta], 'tta_params': tta_params, 'img_ids': img_ids}
 
     def _get_tta_data(self, i, row):
         original_specs = {'ud_flip': False, 'lr_flip': False, 'rotation': 0, 'color_shift': False}
@@ -358,22 +442,22 @@ def aggregate_augmentations(img_id, images, tta_params, img_ids, agg_method):
 def test_time_augmentation_transform(image, tta_parameters):
     if tta_parameters['ud_flip']:
         image = np.flipud(image)
-    elif tta_parameters['lr_flip']:
+    if tta_parameters['lr_flip']:
         image = np.fliplr(image)
-    elif tta_parameters['color_shift']:
+    if tta_parameters['color_shift']:
         random_color_shift = reseed(color_seq, deterministic=False)
         image = random_color_shift.augment_image(image)
-    image = rotate(image, tta_parameters['rotation'], preserve_range=True)
+    image = rotate(image, tta_parameters['rotation'])
     return image
 
 
 def test_time_augmentation_inverse_transform(image, tta_parameters):
     image = per_channel_rotation(image.copy(), -1 * tta_parameters['rotation'])
 
+    if tta_parameters['lr_flip']:
+        image = per_channel_fliplr(image.copy())
     if tta_parameters['ud_flip']:
         image = per_channel_flipud(image.copy())
-    elif tta_parameters['lr_flip']:
-        image = per_channel_fliplr(image.copy())
     return image
 
 
@@ -392,10 +476,14 @@ def per_channel_fliplr(x):
 
 
 def per_channel_rotation(x, angle):
-    x_ = x.copy()
-    for i, channel in enumerate(x):
-        x_[i, :, :] = rotate(channel, angle, preserve_range=True)
-    return x_
+    return rotate(x, angle, axes=(1, 2))
+
+
+def rotate(image, angle, axes=(0, 1)):
+    if angle % 90 != 0:
+        raise Exception('Angle must be a multiple of 90.')
+    k = angle // 90
+    return np.rot90(image, k, axes=axes)
 
 
 def to_array(x):
